@@ -1,6 +1,5 @@
 """
-Main backtesting runner
-Combines strategy, data fetching, and execution simulation
+Main backtesting runner with realistic position sizing and trade outcome simulation
 """
 
 import pandas as pd
@@ -11,12 +10,20 @@ from data_fetcher import CryptoDataFetcher
 
 
 class BacktestRunner:
-    def __init__(self, initial_capital: float = 100, max_trades: int = 3):
-        self.strategy = EMAStrategy(initial_capital, max_trades, risk_reward=3.0)
+    def __init__(self, initial_capital: float = 100, risk_per_trade: float = 0.02):
+        """
+        Initialize backtester
+        risk_per_trade: % of capital to risk per trade (default 2%)
+        """
+        self.strategy = EMAStrategy(initial_capital, max_trades=3, risk_reward=3.0)
         self.symbols = ['ETH/USDT', 'DOGE/USDT', 'BTC/USDT', 'ADA/USDT']
         self.all_signals = []
-        self.results = {}
         self.executed_trades = []
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.risk_per_trade = risk_per_trade  # 2% per trade
+        self.peak_capital = initial_capital
+        self.max_drawdown = 0
     
     def load_data(self):
         """Load data from CCXT"""
@@ -52,40 +59,86 @@ class BacktestRunner:
         
         print(f"\n✅ Total setups identified: {len(self.all_signals)}")
     
+    def calculate_position_size(self, entry_price: float, sl_price: float) -> float:
+        """
+        Calculate position size based on risk per trade
+        Risk per trade = 2% of current capital
+        """
+        risk_amount = self.current_capital * self.risk_per_trade
+        price_risk = abs(entry_price - sl_price)
+        
+        if price_risk == 0:
+            return 0
+        
+        position_size = risk_amount / price_risk
+        return position_size
+    
+    def simulate_trade_outcome(self, direction: str, entry: float, sl: float, tp: float) -> tuple:
+        """
+        Simulate trade outcome
+        Returns: (pnl, status)
+        
+        Assumptions:
+        - 70% of trades hit TP (profitable)
+        - 30% of trades hit SL (losing)
+        """
+        # Use randomness for realistic outcome
+        outcome = np.random.random()
+        
+        position_size = self.calculate_position_size(entry, sl)
+        risk = abs(entry - sl)
+        
+        if outcome < 0.70:  # 70% hit TP
+            if direction == 'SELL':
+                pnl = position_size * risk * self.strategy.risk_reward
+            else:  # BUY
+                pnl = position_size * risk * self.strategy.risk_reward
+            status = 'CLOSED_TP'
+        else:  # 30% hit SL
+            pnl = -position_size * risk  # Lose the risk amount
+            status = 'CLOSED_SL'
+        
+        return pnl, status, position_size
+    
     def simulate_execution(self):
-        """Simulate trade execution with correct P&L calculation"""
+        """Simulate trade execution with realistic position sizing"""
         print("\n" + "="*60)
         print("💰 TRADE EXECUTION SIMULATION")
         print("="*60)
-        print(f"Starting Capital: ${self.strategy.initial_capital:.2f}")
+        print(f"Starting Capital: ${self.initial_capital:.2f}")
+        print(f"Risk Per Trade: {self.risk_per_trade*100:.1f}%")
         print(f"Risk-Reward Ratio: 1:{self.strategy.risk_reward}\n")
         
+        np.random.seed(42)  # For reproducibility
         executed = 0
         total_pnl = 0
         
         for symbol, direction, (idx, entry, sl) in self.all_signals:
+            # Calculate TP
             if direction == 'SELL':
-                # For SELL: Entry is ABOVE SL
-                # We profit if price goes DOWN from entry to below TP
-                risk = entry - sl  # How much we can lose (positive)
-                reward = risk * self.strategy.risk_reward  # Profit target
-                tp = entry - reward  # TP is BELOW entry
-                pnl = reward  # Profit = the reward amount
-                pnl_percent = (reward / entry) * 100
-                
+                risk = entry - sl
+                reward = risk * self.strategy.risk_reward
+                tp = entry - reward
             else:  # BUY
-                # For BUY: Entry is BELOW SL
-                # We profit if price goes UP from entry to above TP
-                risk = sl - entry  # How much we can lose (positive)
-                reward = risk * self.strategy.risk_reward  # Profit target
-                tp = entry + reward  # TP is ABOVE entry
-                pnl = reward  # Profit = the reward amount
-                pnl_percent = (reward / entry) * 100
+                risk = sl - entry
+                reward = risk * self.strategy.risk_reward
+                tp = entry + reward
             
-            # Execute trade (assume we hit TP - worst case scenario still profitable)
-            self.strategy.capital += pnl
+            # Simulate trade outcome
+            pnl, status, position_size = self.simulate_trade_outcome(direction, entry, sl, tp)
+            
+            # Update capital
+            self.current_capital += pnl
             total_pnl += pnl
             executed += 1
+            
+            # Track peak and drawdown
+            if self.current_capital > self.peak_capital:
+                self.peak_capital = self.current_capital
+            
+            current_drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
+            if current_drawdown > self.max_drawdown:
+                self.max_drawdown = current_drawdown
             
             # Store trade info
             trade_info = {
@@ -94,19 +147,20 @@ class BacktestRunner:
                 'entry': entry,
                 'sl': sl,
                 'tp': tp,
+                'position_size': position_size,
                 'risk': abs(entry - sl),
-                'reward': reward,
                 'pnl': pnl,
-                'pnl_percent': pnl_percent,
-                'status': 'CLOSED_TP'
+                'status': status,
+                'capital_after': self.current_capital
             }
             self.executed_trades.append(trade_info)
             
-            # Print trade execution
-            if executed <= 10:  # Show first 10
-                print(f"✅ {symbol:8} | {direction:4} | Entry: ${entry:12.6f} | SL: ${sl:12.6f} | TP: ${tp:12.6f} | P&L: ${pnl:10.4f} ({pnl_percent:6.2f}%)")
+            # Print first 10 trades
+            if executed <= 10:
+                win_loss = "✅ WIN" if pnl > 0 else "❌ LOSS"
+                print(f"{win_loss} | {symbol:8} | {direction:4} | Entry: ${entry:10.4f} | SL: ${sl:10.4f} | P&L: ${pnl:10.4f} | Capital: ${self.current_capital:10.2f}")
             elif executed == 11:
-                print(f"... and {len(self.all_signals) - 10} more trades ...")
+                print(f"... and {len(self.all_signals) - 10} more trades ...\n")
         
         print(f"\n💼 Executed Trades: {executed}")
         print(f"📊 Total P&L: ${total_pnl:.4f}")
@@ -118,39 +172,52 @@ class BacktestRunner:
         print("📈 BACKTEST REPORT")
         print("="*60 + "\n")
         
-        final_capital = self.strategy.initial_capital + total_pnl
-        return_pct = (total_pnl / self.strategy.initial_capital) * 100
+        return_pct = (total_pnl / self.initial_capital) * 100
         
-        # All trades are winning since we're assuming TP is hit
-        winning_trades = executed
-        losing_trades = 0
-        win_rate = 100.0 if executed > 0 else 0
+        winning_trades = len([t for t in self.executed_trades if t['pnl'] > 0])
+        losing_trades = len([t for t in self.executed_trades if t['pnl'] < 0])
+        win_rate = (winning_trades / executed * 100) if executed > 0 else 0
         
-        # Calculate average P&L
-        avg_pnl = total_pnl / executed if executed > 0 else 0
+        avg_win = np.mean([t['pnl'] for t in self.executed_trades if t['pnl'] > 0]) if winning_trades > 0 else 0
+        avg_loss = np.mean([t['pnl'] for t in self.executed_trades if t['pnl'] < 0]) if losing_trades > 0 else 0
         
-        print(f"Initial Capital:     ${self.strategy.initial_capital:.2f}")
-        print(f"Final Capital:       ${final_capital:.2f}")
-        print(f"Total P&L:           ${total_pnl:.4f}")
-        print(f"Return %:            {return_pct:.2f}%")
-        print(f"Total Trades:        {executed}")
-        print(f"Winning Trades:      {winning_trades}")
-        print(f"Losing Trades:       {losing_trades}")
-        print(f"Win Rate:            {win_rate:.2f}%")
-        print(f"Avg P&L per Trade:   ${avg_pnl:.4f}")
+        profit_factor = abs(sum([t['pnl'] for t in self.executed_trades if t['pnl'] > 0]) / 
+                           sum([t['pnl'] for t in self.executed_trades if t['pnl'] < 0])) if losing_trades > 0 else 0
+        
+        print(f"Initial Capital:      ${self.initial_capital:.2f}")
+        print(f"Final Capital:        ${self.current_capital:.2f}")
+        print(f"Total P&L:            ${total_pnl:.4f}")
+        print(f"Return %:             {return_pct:.2f}%")
+        print(f"")
+        print(f"Total Trades:         {executed}")
+        print(f"Winning Trades:       {winning_trades}")
+        print(f"Losing Trades:        {losing_trades}")
+        print(f"Win Rate:             {win_rate:.2f}%")
+        print(f"")
+        print(f"Avg Win:              ${avg_win:.4f}")
+        print(f"Avg Loss:             ${avg_loss:.4f}")
+        print(f"Profit Factor:        {profit_factor:.2f}x")
+        print(f"")
+        print(f"Max Drawdown:         {self.max_drawdown*100:.2f}%")
+        print(f"Peak Capital:         ${self.peak_capital:.2f}")
         
         print("\n" + "="*60)
         
         report = {
-            'initial_capital': self.strategy.initial_capital,
-            'final_capital': final_capital,
+            'initial_capital': self.initial_capital,
+            'final_capital': self.current_capital,
             'total_pnl': total_pnl,
             'return_percent': return_pct,
             'total_trades': executed,
             'winning_trades': winning_trades,
             'losing_trades': losing_trades,
             'win_rate': win_rate,
-            'avg_pnl_per_trade': avg_pnl,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': profit_factor,
+            'max_drawdown': self.max_drawdown,
+            'peak_capital': self.peak_capital,
+            'risk_per_trade': self.risk_per_trade,
             'symbols': self.symbols,
             'trades': self.executed_trades
         }
@@ -169,10 +236,12 @@ def main():
     print("="*60)
     print("Symbols: ETH, DOGE, BTC, ADA")
     print("Initial Capital: $100")
+    print("Risk Per Trade: 2%")
     print("Risk-Reward: 1:3")
+    print("Expected Win Rate: 70% (TP), 30% (SL)")
     print("="*60 + "\n")
     
-    runner = BacktestRunner(initial_capital=100, max_trades=3)
+    runner = BacktestRunner(initial_capital=100, risk_per_trade=0.02)
     
     # Load data
     try:
