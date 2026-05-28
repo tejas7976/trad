@@ -1,10 +1,12 @@
 """
-Main backtesting runner with realistic position sizing and trade outcome simulation
+Main backtesting runner with 3-month historical data
 """
 
 import pandas as pd
 import numpy as np
 import json
+import os
+from datetime import datetime
 from ema_strategy import EMAStrategy
 from data_fetcher import CryptoDataFetcher
 
@@ -24,22 +26,89 @@ class BacktestRunner:
         self.risk_per_trade = risk_per_trade  # 2% per trade
         self.peak_capital = initial_capital
         self.max_drawdown = 0
+        self.backtest_start_date = None
+        self.backtest_end_date = None
     
-    def load_data(self):
-        """Load data from CCXT"""
-        print("📥 Fetching crypto data from Binance...")
+    def load_data_from_csv(self):
+        """Load data from local CSV files"""
+        print("📂 Loading data from CSV files...")
+        data_5m = {}
+        data_15m = {}
+        
+        os.makedirs('data', exist_ok=True)
+        
+        for symbol in self.symbols:
+            csv_5m = f"data/{symbol.replace('/', '_')}_5m_3months.csv"
+            csv_15m = f"data/{symbol.replace('/', '_')}_15m_3months.csv"
+            
+            if os.path.exists(csv_5m):
+                df_5m = pd.read_csv(csv_5m)
+                df_5m['timestamp'] = pd.to_datetime(df_5m['timestamp'])
+                data_5m[symbol] = df_5m
+                print(f"✅ Loaded {symbol} 5m ({len(df_5m)} candles)")
+            else:
+                print(f"⚠️  {csv_5m} not found")
+            
+            if os.path.exists(csv_15m):
+                df_15m = pd.read_csv(csv_15m)
+                df_15m['timestamp'] = pd.to_datetime(df_15m['timestamp'])
+                data_15m[symbol] = df_15m
+                print(f"✅ Loaded {symbol} 15m ({len(df_15m)} candles)")
+            else:
+                print(f"⚠️  {csv_15m} not found")
+        
+        return data_5m, data_15m
+    
+    def load_data_from_api(self):
+        """Fetch data from CCXT API"""
+        print("📥 Fetching data from Binance (3 months)...")
         fetcher = CryptoDataFetcher()
         
-        data_5m = fetcher.fetch_multiple_symbols('5m', limit=500)
-        data_15m = fetcher.fetch_multiple_symbols('15m', limit=500)
+        data_5m = fetcher.fetch_multiple_symbols('5m', days_back=90, limit=500)
+        data_15m = fetcher.fetch_multiple_symbols('15m', days_back=90, limit=500)
+        
+        # Save for future use
+        print("\n💾 Saving data locally...")
+        os.makedirs('data', exist_ok=True)
+        for symbol, df in data_5m.items():
+            if not df.empty:
+                fetcher.save_to_csv(df, f"data/{symbol.replace('/', '_')}_5m_3months.csv")
+        for symbol, df in data_15m.items():
+            if not df.empty:
+                fetcher.save_to_csv(df, f"data/{symbol.replace('/', '_')}_15m_3months.csv")
         
         return data_5m, data_15m
     
     def run_backtest(self, data_5m: dict, data_15m: dict):
         """Run backtest on loaded data"""
         print("\n" + "="*60)
-        print("🚀 STARTING BACKTEST")
+        print("🚀 STARTING 3-MONTH BACKTEST")
         print("="*60 + "\n")
+        
+        # Get date range
+        all_dates_5m = []
+        all_dates_15m = []
+        
+        for df in data_5m.values():
+            if not df.empty and 'timestamp' in df.columns:
+                all_dates_5m.extend(df['timestamp'].values)
+        
+        for df in data_15m.values():
+            if not df.empty and 'timestamp' in df.columns:
+                all_dates_15m.extend(df['timestamp'].values)
+        
+        if all_dates_5m:
+            self.backtest_start_date = pd.Timestamp(min(all_dates_5m)).to_pydatetime()
+        if all_dates_15m and not all_dates_5m:
+            self.backtest_start_date = pd.Timestamp(min(all_dates_15m)).to_pydatetime()
+        
+        if all_dates_5m:
+            self.backtest_end_date = pd.Timestamp(max(all_dates_5m)).to_pydatetime()
+        if all_dates_15m and (not all_dates_5m or pd.Timestamp(max(all_dates_15m)) > pd.Timestamp(self.backtest_end_date)):
+            self.backtest_end_date = pd.Timestamp(max(all_dates_15m)).to_pydatetime()
+        
+        print(f"📅 Backtest Period: {self.backtest_start_date} to {self.backtest_end_date}")
+        print(f"⏱️  Duration: ~90 days (3 months)\n")
         
         # Process SELL signals (5m)
         print("📊 Processing SELL signals (5min)...")
@@ -82,7 +151,6 @@ class BacktestRunner:
         - 70% of trades hit TP (profitable)
         - 30% of trades hit SL (losing)
         """
-        # Use randomness for realistic outcome
         outcome = np.random.random()
         
         position_size = self.calculate_position_size(entry, sl)
@@ -103,7 +171,7 @@ class BacktestRunner:
     def simulate_execution(self):
         """Simulate trade execution with realistic position sizing"""
         print("\n" + "="*60)
-        print("💰 TRADE EXECUTION SIMULATION")
+        print("💰 TRADE EXECUTION SIMULATION (3 Months)")
         print("="*60)
         print(f"Starting Capital: ${self.initial_capital:.2f}")
         print(f"Risk Per Trade: {self.risk_per_trade*100:.1f}%")
@@ -169,7 +237,7 @@ class BacktestRunner:
     def generate_report(self, executed: int, total_pnl: float):
         """Generate final report"""
         print("\n" + "="*60)
-        print("📈 BACKTEST REPORT")
+        print("📈 3-MONTH BACKTEST REPORT")
         print("="*60 + "\n")
         
         return_pct = (total_pnl / self.initial_capital) * 100
@@ -183,6 +251,9 @@ class BacktestRunner:
         
         profit_factor = abs(sum([t['pnl'] for t in self.executed_trades if t['pnl'] > 0]) / 
                            sum([t['pnl'] for t in self.executed_trades if t['pnl'] < 0])) if losing_trades > 0 else 0
+        
+        print(f"📅 Backtest Period: {self.backtest_start_date.date()} to {self.backtest_end_date.date()}")
+        print(f"⏱️  Duration: 90 days (3 months)\n")
         
         print(f"Initial Capital:      ${self.initial_capital:.2f}")
         print(f"Final Capital:        ${self.current_capital:.2f}")
@@ -204,6 +275,11 @@ class BacktestRunner:
         print("\n" + "="*60)
         
         report = {
+            'backtest_period': {
+                'start': str(self.backtest_start_date),
+                'end': str(self.backtest_end_date),
+                'duration_days': 90
+            },
             'initial_capital': self.initial_capital,
             'final_capital': self.current_capital,
             'total_pnl': total_pnl,
@@ -226,13 +302,14 @@ class BacktestRunner:
     
     def save_report(self, report: dict):
         """Save report to JSON"""
-        with open('backtest_report.json', 'w') as f:
+        with open('backtest_report_3months.json', 'w') as f:
             json.dump(report, f, indent=2, default=str)
-        print(f"\n💾 Report saved to backtest_report.json")
+        print(f"\n💾 Report saved to backtest_report_3months.json")
 
 
 def main():
-    print("\n🔧 CRYPTO 5 EMA STRATEGY BACKTESTER")
+    print("\n" + "="*60)
+    print("🔧 CRYPTO 5 EMA STRATEGY BACKTESTER - 3 MONTH TEST")
     print("="*60)
     print("Symbols: ETH, DOGE, BTC, ADA")
     print("Initial Capital: $100")
@@ -243,13 +320,21 @@ def main():
     
     runner = BacktestRunner(initial_capital=100, risk_per_trade=0.02)
     
-    # Load data
+    # Try loading from CSV first, then fetch from API
     try:
-        data_5m, data_15m = runner.load_data()
+        data_5m, data_15m = runner.load_data_from_csv()
+        
+        # Check if data is empty
+        if not any(data_5m.values()) or not any(data_15m.values()):
+            print("\n⚠️  CSV data incomplete. Fetching from API...\n")
+            data_5m, data_15m = runner.load_data_from_api()
     except Exception as e:
-        print(f"❌ Error loading data: {e}")
-        print("⚠️  Make sure you have internet connection and CCXT installed")
-        print("   Install with: pip install ccxt pandas numpy")
+        print(f"❌ Error loading CSV: {e}")
+        print("📥 Fetching from API instead...\n")
+        data_5m, data_15m = runner.load_data_from_api()
+    
+    if not any(data_5m.values()) and not any(data_15m.values()):
+        print("❌ Failed to load any data. Please check your internet connection.")
         return
     
     # Run backtest
