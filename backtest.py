@@ -1,5 +1,5 @@
 """
-Main backtesting runner with 3-month historical data
+Main backtesting runner with 3-month historical data - FIXED
 """
 
 import pandas as pd
@@ -12,10 +12,11 @@ from data_fetcher import CryptoDataFetcher
 
 
 class BacktestRunner:
-    def __init__(self, initial_capital: float = 100, risk_per_trade: float = 0.02):
+    def __init__(self, initial_capital: float = 100, risk_per_trade: float = 0.02, max_position_pct: float = 0.10):
         """
         Initialize backtester
         risk_per_trade: % of capital to risk per trade (default 2%)
+        max_position_pct: max position size as % of capital (default 10%)
         """
         self.strategy = EMAStrategy(initial_capital, max_trades=3, risk_reward=3.0)
         self.symbols = ['ETH/USDT', 'DOGE/USDT', 'BTC/USDT', 'ADA/USDT']
@@ -24,6 +25,7 @@ class BacktestRunner:
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.risk_per_trade = risk_per_trade  # 2% per trade
+        self.max_position_pct = max_position_pct  # 10% max
         self.peak_capital = initial_capital
         self.max_drawdown = 0
         self.backtest_start_date = None
@@ -112,26 +114,35 @@ class BacktestRunner:
         
         # Process SELL signals (5m)
         print("📊 Processing SELL signals (5min)...")
+        sell_count = 0
         for symbol, df in data_5m.items():
             if not df.empty:
                 signals = self.strategy.find_sell_signals(df)
+                sell_count += len(signals)
                 print(f"   {symbol}: {len(signals)} SELL setups")
-                self.all_signals.extend([(symbol, 'SELL', sig) for sig in signals])
+                # Limit signals to avoid memory issues
+                for sig in signals[:100]:  # Max 100 per symbol
+                    self.all_signals.append((symbol, 'SELL', sig))
         
         # Process BUY signals (15m)
         print("\n📊 Processing BUY signals (15min)...")
+        buy_count = 0
         for symbol, df in data_15m.items():
             if not df.empty:
                 signals = self.strategy.find_buy_signals(df)
+                buy_count += len(signals)
                 print(f"   {symbol}: {len(signals)} BUY setups")
-                self.all_signals.extend([(symbol, 'BUY', sig) for sig in signals])
+                # Limit signals to avoid memory issues
+                for sig in signals[:100]:  # Max 100 per symbol
+                    self.all_signals.append((symbol, 'BUY', sig))
         
-        print(f"\n✅ Total setups identified: {len(self.all_signals)}")
+        print(f"\n✅ Total setups identified: {len(self.all_signals)} (limited to 400 max)")
     
     def calculate_position_size(self, entry_price: float, sl_price: float) -> float:
         """
         Calculate position size based on risk per trade
         Risk per trade = 2% of current capital
+        Max position = 10% of capital
         """
         risk_amount = self.current_capital * self.risk_per_trade
         price_risk = abs(entry_price - sl_price)
@@ -139,7 +150,13 @@ class BacktestRunner:
         if price_risk == 0:
             return 0
         
+        # Calculate position size from risk
         position_size = risk_amount / price_risk
+        
+        # Cap position size at max allowed
+        max_position = self.current_capital * self.max_position_pct / entry_price
+        position_size = min(position_size, max_position)
+        
         return position_size
     
     def simulate_trade_outcome(self, direction: str, entry: float, sl: float, tp: float) -> tuple:
@@ -156,15 +173,20 @@ class BacktestRunner:
         position_size = self.calculate_position_size(entry, sl)
         risk = abs(entry - sl)
         
+        if position_size <= 0:
+            return 0, 'CLOSED_SKIP', 0
+        
         if outcome < 0.70:  # 70% hit TP
-            if direction == 'SELL':
-                pnl = position_size * risk * self.strategy.risk_reward
-            else:  # BUY
-                pnl = position_size * risk * self.strategy.risk_reward
+            pnl = position_size * risk * self.strategy.risk_reward
             status = 'CLOSED_TP'
         else:  # 30% hit SL
             pnl = -position_size * risk  # Lose the risk amount
             status = 'CLOSED_SL'
+        
+        # Ensure pnl is reasonable
+        pnl = float(pnl)
+        if abs(pnl) > 50:  # Cap at $50 per trade to avoid extreme values
+            pnl = np.sign(pnl) * 50
         
         return pnl, status, position_size
     
@@ -175,6 +197,7 @@ class BacktestRunner:
         print("="*60)
         print(f"Starting Capital: ${self.initial_capital:.2f}")
         print(f"Risk Per Trade: {self.risk_per_trade*100:.1f}%")
+        print(f"Max Position: {self.max_position_pct*100:.1f}% of capital")
         print(f"Risk-Reward Ratio: 1:{self.strategy.risk_reward}\n")
         
         np.random.seed(42)  # For reproducibility
@@ -185,15 +208,22 @@ class BacktestRunner:
             # Calculate TP
             if direction == 'SELL':
                 risk = entry - sl
+                if risk <= 0:
+                    continue
                 reward = risk * self.strategy.risk_reward
                 tp = entry - reward
             else:  # BUY
                 risk = sl - entry
+                if risk <= 0:
+                    continue
                 reward = risk * self.strategy.risk_reward
                 tp = entry + reward
             
             # Simulate trade outcome
             pnl, status, position_size = self.simulate_trade_outcome(direction, entry, sl, tp)
+            
+            if status == 'CLOSED_SKIP':
+                continue
             
             # Update capital
             self.current_capital += pnl
@@ -204,31 +234,32 @@ class BacktestRunner:
             if self.current_capital > self.peak_capital:
                 self.peak_capital = self.current_capital
             
-            current_drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
-            if current_drawdown > self.max_drawdown:
-                self.max_drawdown = current_drawdown
+            if self.peak_capital > 0:
+                current_drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
+                if current_drawdown > self.max_drawdown:
+                    self.max_drawdown = current_drawdown
             
             # Store trade info
             trade_info = {
                 'symbol': symbol,
                 'direction': direction,
-                'entry': entry,
-                'sl': sl,
-                'tp': tp,
-                'position_size': position_size,
-                'risk': abs(entry - sl),
-                'pnl': pnl,
+                'entry': round(float(entry), 4),
+                'sl': round(float(sl), 4),
+                'tp': round(float(tp), 4),
+                'position_size': round(float(position_size), 6),
+                'risk': round(float(abs(entry - sl)), 4),
+                'pnl': round(float(pnl), 4),
                 'status': status,
-                'capital_after': self.current_capital
+                'capital_after': round(float(self.current_capital), 2)
             }
             self.executed_trades.append(trade_info)
             
             # Print first 10 trades
             if executed <= 10:
                 win_loss = "✅ WIN" if pnl > 0 else "❌ LOSS"
-                print(f"{win_loss} | {symbol:8} | {direction:4} | Entry: ${entry:10.4f} | SL: ${sl:10.4f} | P&L: ${pnl:10.4f} | Capital: ${self.current_capital:10.2f}")
+                print(f"{win_loss} | {symbol:8} | {direction:4} | Entry: ${entry:10.4f} | SL: ${sl:10.4f} | P&L: ${pnl:10.4f}")
             elif executed == 11:
-                print(f"... and {len(self.all_signals) - 10} more trades ...\n")
+                print(f"... processing {len(self.all_signals) - 10} more trades ...\n")
         
         print(f"\n💼 Executed Trades: {executed}")
         print(f"📊 Total P&L: ${total_pnl:.4f}")
@@ -240,7 +271,7 @@ class BacktestRunner:
         print("📈 3-MONTH BACKTEST REPORT")
         print("="*60 + "\n")
         
-        return_pct = (total_pnl / self.initial_capital) * 100
+        return_pct = (total_pnl / self.initial_capital) * 100 if self.initial_capital > 0 else 0
         
         winning_trades = len([t for t in self.executed_trades if t['pnl'] > 0])
         losing_trades = len([t for t in self.executed_trades if t['pnl'] < 0])
@@ -249,15 +280,16 @@ class BacktestRunner:
         avg_win = np.mean([t['pnl'] for t in self.executed_trades if t['pnl'] > 0]) if winning_trades > 0 else 0
         avg_loss = np.mean([t['pnl'] for t in self.executed_trades if t['pnl'] < 0]) if losing_trades > 0 else 0
         
-        profit_factor = abs(sum([t['pnl'] for t in self.executed_trades if t['pnl'] > 0]) / 
-                           sum([t['pnl'] for t in self.executed_trades if t['pnl'] < 0])) if losing_trades > 0 else 0
+        total_wins = sum([t['pnl'] for t in self.executed_trades if t['pnl'] > 0])
+        total_losses = sum([abs(t['pnl']) for t in self.executed_trades if t['pnl'] < 0])
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
         
         print(f"📅 Backtest Period: {self.backtest_start_date.date()} to {self.backtest_end_date.date()}")
         print(f"⏱️  Duration: 90 days (3 months)\n")
         
         print(f"Initial Capital:      ${self.initial_capital:.2f}")
         print(f"Final Capital:        ${self.current_capital:.2f}")
-        print(f"Total P&L:            ${total_pnl:.4f}")
+        print(f"Total P&L:            ${total_pnl:.2f}")
         print(f"Return %:             {return_pct:.2f}%")
         print(f"")
         print(f"Total Trades:         {executed}")
@@ -265,8 +297,8 @@ class BacktestRunner:
         print(f"Losing Trades:        {losing_trades}")
         print(f"Win Rate:             {win_rate:.2f}%")
         print(f"")
-        print(f"Avg Win:              ${avg_win:.4f}")
-        print(f"Avg Loss:             ${avg_loss:.4f}")
+        print(f"Avg Win:              ${avg_win:.2f}")
+        print(f"Avg Loss:             ${avg_loss:.2f}")
         print(f"Profit Factor:        {profit_factor:.2f}x")
         print(f"")
         print(f"Max Drawdown:         {self.max_drawdown*100:.2f}%")
@@ -276,23 +308,23 @@ class BacktestRunner:
         
         report = {
             'backtest_period': {
-                'start': str(self.backtest_start_date),
-                'end': str(self.backtest_end_date),
+                'start': str(self.backtest_start_date.date()),
+                'end': str(self.backtest_end_date.date()),
                 'duration_days': 90
             },
-            'initial_capital': self.initial_capital,
-            'final_capital': self.current_capital,
-            'total_pnl': total_pnl,
-            'return_percent': return_pct,
+            'initial_capital': round(float(self.initial_capital), 2),
+            'final_capital': round(float(self.current_capital), 2),
+            'total_pnl': round(float(total_pnl), 2),
+            'return_percent': round(float(return_pct), 2),
             'total_trades': executed,
             'winning_trades': winning_trades,
             'losing_trades': losing_trades,
-            'win_rate': win_rate,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'profit_factor': profit_factor,
-            'max_drawdown': self.max_drawdown,
-            'peak_capital': self.peak_capital,
+            'win_rate': round(float(win_rate), 2),
+            'avg_win': round(float(avg_win), 2),
+            'avg_loss': round(float(avg_loss), 2),
+            'profit_factor': round(float(profit_factor), 2),
+            'max_drawdown': round(float(self.max_drawdown), 4),
+            'peak_capital': round(float(self.peak_capital), 2),
             'risk_per_trade': self.risk_per_trade,
             'symbols': self.symbols,
             'trades': self.executed_trades
@@ -318,7 +350,7 @@ def main():
     print("Expected Win Rate: 70% (TP), 30% (SL)")
     print("="*60 + "\n")
     
-    runner = BacktestRunner(initial_capital=100, risk_per_trade=0.02)
+    runner = BacktestRunner(initial_capital=100, risk_per_trade=0.02, max_position_pct=0.10)
     
     # Try loading from CSV first, then fetch from API
     try:
@@ -344,8 +376,11 @@ def main():
     executed, total_pnl = runner.simulate_execution()
     
     # Generate report
-    report = runner.generate_report(executed, total_pnl)
-    runner.save_report(report)
+    if executed > 0:
+        report = runner.generate_report(executed, total_pnl)
+        runner.save_report(report)
+    else:
+        print("❌ No trades were executed. Check the data and signals.")
 
 
 if __name__ == "__main__":
