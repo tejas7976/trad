@@ -1,5 +1,5 @@
 """
-Main backtesting runner with 3-month historical data - FIXED
+Main backtesting runner with 3-month historical data - DEBUGGED & FIXED
 """
 
 import pandas as pd
@@ -30,6 +30,7 @@ class BacktestRunner:
         self.max_drawdown = 0
         self.backtest_start_date = None
         self.backtest_end_date = None
+        self.skipped_signals = 0
     
     def load_data_from_csv(self):
         """Load data from local CSV files"""
@@ -119,10 +120,15 @@ class BacktestRunner:
             if not df.empty:
                 signals = self.strategy.find_sell_signals(df)
                 sell_count += len(signals)
-                print(f"   {symbol}: {len(signals)} SELL setups")
-                # Limit signals to avoid memory issues
-                for sig in signals[:100]:  # Max 100 per symbol
-                    self.all_signals.append((symbol, 'SELL', sig))
+                print(f"   {symbol}: {len(signals)} SELL setups found")
+                # Take first 100 per symbol
+                for sig in signals[:100]:
+                    idx, entry, sl = sig
+                    # Validate: for SELL, entry should be > sl
+                    if entry > sl:
+                        self.all_signals.append((symbol, 'SELL', sig))
+                    else:
+                        self.skipped_signals += 1
         
         # Process BUY signals (15m)
         print("\n📊 Processing BUY signals (15min)...")
@@ -131,12 +137,18 @@ class BacktestRunner:
             if not df.empty:
                 signals = self.strategy.find_buy_signals(df)
                 buy_count += len(signals)
-                print(f"   {symbol}: {len(signals)} BUY setups")
-                # Limit signals to avoid memory issues
-                for sig in signals[:100]:  # Max 100 per symbol
-                    self.all_signals.append((symbol, 'BUY', sig))
+                print(f"   {symbol}: {len(signals)} BUY setups found")
+                # Take first 100 per symbol
+                for sig in signals[:100]:
+                    idx, entry, sl = sig
+                    # Validate: for BUY, sl should be < entry
+                    if sl < entry:
+                        self.all_signals.append((symbol, 'BUY', sig))
+                    else:
+                        self.skipped_signals += 1
         
-        print(f"\n✅ Total setups identified: {len(self.all_signals)} (limited to 400 max)")
+        print(f"\n✅ Valid setups: {len(self.all_signals)}")
+        print(f"⚠️  Invalid/Skipped: {self.skipped_signals}")
     
     def calculate_position_size(self, entry_price: float, sl_price: float) -> float:
         """
@@ -147,7 +159,7 @@ class BacktestRunner:
         risk_amount = self.current_capital * self.risk_per_trade
         price_risk = abs(entry_price - sl_price)
         
-        if price_risk == 0:
+        if price_risk == 0 or price_risk < 0.0001:
             return 0
         
         # Calculate position size from risk
@@ -185,7 +197,7 @@ class BacktestRunner:
         
         # Ensure pnl is reasonable
         pnl = float(pnl)
-        if abs(pnl) > 50:  # Cap at $50 per trade to avoid extreme values
+        if abs(pnl) > 50:  # Cap at $50 per trade
             pnl = np.sign(pnl) * 50
         
         return pnl, status, position_size
@@ -204,20 +216,23 @@ class BacktestRunner:
         executed = 0
         total_pnl = 0
         
-        for symbol, direction, (idx, entry, sl) in self.all_signals:
-            # Calculate TP
+        for symbol, direction, sig in self.all_signals:
+            idx, entry, sl = sig
+            
+            # Validate signal
             if direction == 'SELL':
+                if entry <= sl:
+                    continue
                 risk = entry - sl
-                if risk <= 0:
-                    continue
-                reward = risk * self.strategy.risk_reward
-                tp = entry - reward
+                tp = entry - risk * self.strategy.risk_reward
             else:  # BUY
-                risk = sl - entry
-                if risk <= 0:
+                if sl <= entry:
                     continue
-                reward = risk * self.strategy.risk_reward
-                tp = entry + reward
+                risk = sl - entry
+                tp = entry + risk * self.strategy.risk_reward
+            
+            if risk <= 0.0001:
+                continue
             
             # Simulate trade outcome
             pnl, status, position_size = self.simulate_trade_outcome(direction, entry, sl, tp)
@@ -247,7 +262,7 @@ class BacktestRunner:
                 'sl': round(float(sl), 4),
                 'tp': round(float(tp), 4),
                 'position_size': round(float(position_size), 6),
-                'risk': round(float(abs(entry - sl)), 4),
+                'risk': round(float(risk), 4),
                 'pnl': round(float(pnl), 4),
                 'status': status,
                 'capital_after': round(float(self.current_capital), 2)
@@ -257,9 +272,9 @@ class BacktestRunner:
             # Print first 10 trades
             if executed <= 10:
                 win_loss = "✅ WIN" if pnl > 0 else "❌ LOSS"
-                print(f"{win_loss} | {symbol:8} | {direction:4} | Entry: ${entry:10.4f} | SL: ${sl:10.4f} | P&L: ${pnl:10.4f}")
+                print(f"{win_loss} | {symbol:8} | {direction:4} | Entry: ${entry:10.4f} | SL: ${sl:10.4f} | TP: ${tp:10.4f} | P&L: ${pnl:8.4f}")
             elif executed == 11:
-                print(f"... processing {len(self.all_signals) - 10} more trades ...\n")
+                print(f"... and {len(self.all_signals) - 10} more trades processing ...\n")
         
         print(f"\n💼 Executed Trades: {executed}")
         print(f"📊 Total P&L: ${total_pnl:.4f}")
@@ -380,7 +395,9 @@ def main():
         report = runner.generate_report(executed, total_pnl)
         runner.save_report(report)
     else:
-        print("❌ No trades were executed. Check the data and signals.")
+        print("\n⚠️  No valid trades were executed.")
+        print(f"📊 Found {len(runner.all_signals)} signals, but all had issues")
+        print(f"⛔ Skipped {runner.skipped_signals} invalid signals")
 
 
 if __name__ == "__main__":
